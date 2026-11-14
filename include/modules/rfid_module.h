@@ -1,3 +1,4 @@
+
 #ifndef RFID_MODULE_H
 #define RFID_MODULE_H
 
@@ -5,44 +6,31 @@
 #include <SPI.h>
 #include <MFRC522.h>
 
-// ==========================================
-// RFID CONFIGURATION
-// ==========================================
-
 namespace RFIDConfig
 {
 
-    // SPI GPIO configuration
-    constexpr uint8_t SS_PIN = 39;
-    constexpr uint8_t SCK_PIN = 38;
-    constexpr uint8_t MOSI_PIN = 37;
-    constexpr uint8_t MISO_PIN = 36;
+    static constexpr uint8_t SS_PIN = 39;
+    static constexpr uint8_t SCK_PIN = 38;
+    static constexpr uint8_t MOSI_PIN = 37;
+    static constexpr uint8_t MISO_PIN = 36;
 
-    // Additional GPIOs
-    constexpr uint8_t IRQ_PIN = 35;
-    constexpr uint8_t RST_PIN = 21;
+    // Dedicated RTC-capable external interrupt.
+    static constexpr uint8_t IRQ_PIN = 1;
 
-    // Scanning configuration
-    constexpr bool SCANNING_ENABLED_AT_BOOT = true;
+    static constexpr uint8_t RST_PIN = 21;
 
-    constexpr uint16_t SCAN_INTERVAL_MS = 50;
+    static constexpr bool SCANNING_ENABLED_AT_BOOT = true;
 
-    constexpr uint16_t CARD_REMOVAL_TIMEOUT_MS = 500;
+    static constexpr uint32_t SCAN_INTERVAL_MS = 50;
+    static constexpr uint32_t CARD_REMOVAL_TIMEOUT_MS = 500;
 
-    // Deep sleep wake-up configuration
-    // Disabled by default.
-    constexpr bool WAKEUP_ENABLED = false;
+    // MFRC522 IRQ output is active LOW.
+    static constexpr uint8_t IRQ_ACTIVE_LEVEL = LOW;
 
-    // GPIO35 is NOT RTC-capable on ESP32-S3.
-    // This pin must be changed and physically rewired
-    // before implementing deep sleep wake-up.
-    constexpr uint8_t WAKEUP_PIN = IRQ_PIN;
-
+    // ComIEnReg: enable RxIRq only.
+    // Bit 7 = 0 keeps the IRQ output active LOW.
+    static constexpr uint8_t RX_INTERRUPT_MASK = 0x20;
 }
-
-// ==========================================
-// RFID MODULE
-// ==========================================
 
 class RFIDModule
 {
@@ -50,53 +38,54 @@ class RFIDModule
 public:
     RFIDModule();
 
-    // Initialization
     bool begin();
-
-    // Scanning control
     void update();
 
     void setScanning(bool enabled);
-
     bool isScanning() const;
 
-    // Tag information
     bool isCardPresent() const;
 
     String getLastUID() const;
-
     uint8_t getLastUIDSize() const;
-
     uint32_t getLastDetectionTime() const;
 
-    // Wake-up configuration
+    // Hardware interrupt monitoring.
+    bool isIRQEnabled() const;
+    uint32_t getIRQCount() const;
+    bool isIRQActive() const;
+
+    // Returns false for the MFRC522 because its receiver
+    // cannot autonomously interrogate newly presented
+    // passive cards throughout ESP32 deep sleep.
+    bool prepareForSleepWake();
+
+    // Compatibility with the previously defined interface.
     bool isWakeupEnabled() const;
 
-    // Status
     void printStatus(Stream &output) const;
 
 private:
     MFRC522 reader;
 
     bool initialized;
-    bool scanning;
+    bool scanningEnabled;
+    bool irqEnabled;
     bool cardPresent;
 
     String lastUID;
-
     uint8_t lastUIDSize;
 
     uint32_t lastDetectionTime;
     uint32_t lastScanTime;
 
-    // Internal functions
-    bool readCard();
+    void enableReceiveIRQ();
+    void disableReceiveIRQ();
+    void clearReceiveIRQ();
 
+    void scanCard();
+    void handleCardRemoval();
     String formatUID();
-
-    void handleCardDetected();
-
-    void handleCardRemoved();
 };
 
 #endif

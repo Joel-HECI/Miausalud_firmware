@@ -1,15 +1,30 @@
+
 #include "modules/rfid_module.h"
 
-// ==========================================
+namespace
+{
+
+    volatile bool rfidIRQPending = false;
+    volatile uint32_t rfidIRQCount = 0;
+
+    void IRAM_ATTR onRFIDInterrupt()
+    {
+        rfidIRQPending = true;
+        rfidIRQCount++;
+    }
+}
+
+// ============================================================
 // CONSTRUCTOR
-// ==========================================
+// ============================================================
 
 RFIDModule::RFIDModule()
     : reader(
           RFIDConfig::SS_PIN,
           RFIDConfig::RST_PIN),
       initialized(false),
-      scanning(false),
+      scanningEnabled(false),
+      irqEnabled(false),
       cardPresent(false),
       lastUID(""),
       lastUIDSize(0),
@@ -18,276 +33,377 @@ RFIDModule::RFIDModule()
 {
 }
 
-// ==========================================
+// ============================================================
 // INITIALIZATION
-// ==========================================
+// ============================================================
 
 bool RFIDModule::begin()
 {
-    Serial.println("[RFID] Initializing module...");
+    initialized = false;
+    scanningEnabled = false;
+    irqEnabled = false;
+    cardPresent = false;
 
-    // Initialize SPI with custom GPIO configuration
+    rfidIRQPending = false;
+    rfidIRQCount = 0;
+
+    // The scheduler restores GPIO1 after RTC EXT0 wake.
+    pinMode(RFIDConfig::IRQ_PIN, INPUT_PULLUP);
+
     SPI.begin(
         RFIDConfig::SCK_PIN,
         RFIDConfig::MISO_PIN,
         RFIDConfig::MOSI_PIN,
         RFIDConfig::SS_PIN);
 
-    // Configure IRQ input
-    pinMode(RFIDConfig::IRQ_PIN, INPUT);
-
-    // Initialize MFRC522
     reader.PCD_Init();
 
-    delay(50);
+    delay(5);
 
-    // Verify reader communication
     byte version = reader.PCD_ReadRegister(
         MFRC522::VersionReg);
 
     if (version == 0x00 || version == 0xFF)
     {
-        Serial.println("[RFID] Reader communication FAILED");
-
-        initialized = false;
+        Serial.println(
+            "[RFID] MFRC522 not responding.");
         return false;
     }
 
     initialized = true;
 
-    scanning = RFIDConfig::SCANNING_ENABLED_AT_BOOT;
-
     reader.PCD_AntennaOn();
 
-    Serial.println("[RFID] Initialization successful");
+    // Clear leftover reader interrupts.
+    clearReceiveIRQ();
+
+    // Route receive-complete interrupt to IRQ pin.
+    enableReceiveIRQ();
+
+    attachInterrupt(
+        digitalPinToInterrupt(RFIDConfig::IRQ_PIN),
+        onRFIDInterrupt,
+        FALLING);
+
+    irqEnabled = true;
+
+    setScanning(
+        RFIDConfig::SCANNING_ENABLED_AT_BOOT);
 
     Serial.printf(
         "[RFID] MFRC522 version: 0x%02X\n",
         version);
 
     Serial.printf(
-        "[RFID] SPI SS: GPIO%u\n",
-        RFIDConfig::SS_PIN);
-
-    Serial.printf(
-        "[RFID] IRQ: GPIO%u\n",
+        "[RFID] IRQ GPIO: %u\n",
         RFIDConfig::IRQ_PIN);
 
-    Serial.printf(
-        "[RFID] Scanning: %s\n",
-        scanning ? "ON" : "OFF");
-
-    Serial.printf(
-        "[RFID] Deep sleep wake-up: %s\n",
-        isWakeupEnabled() ? "ON" : "OFF");
+    Serial.println(
+        "[RFID] Receive IRQ monitoring enabled.");
 
     return true;
 }
 
-// ==========================================
-// SCANNING CONTROL
-// ==========================================
+// ============================================================
+// CLEAR INTERRUPTS
+// ============================================================
+
+void RFIDModule::clearReceiveIRQ()
+{
+    if (!initialized)
+    {
+        return;
+    }
+
+    // Writing ones clears the corresponding IRQ flags.
+    reader.PCD_WriteRegister(
+        MFRC522::ComIrqReg,
+        0x7F);
+
+    rfidIRQPending = false;
+}
+
+// ============================================================
+// ENABLE RECEIVE INTERRUPT
+// ============================================================
+
+void RFIDModule::enableReceiveIRQ()
+{
+    if (!initialized)
+    {
+        return;
+    }
+
+    clearReceiveIRQ();
+
+    reader.PCD_WriteRegister(
+        MFRC522::ComIEnReg,
+        RFIDConfig::RX_INTERRUPT_MASK);
+}
+
+// ============================================================
+// DISABLE RECEIVE INTERRUPT
+// ============================================================
+
+void RFIDModule::disableReceiveIRQ()
+{
+    if (!initialized)
+    {
+        return;
+    }
+
+    reader.PCD_WriteRegister(
+        MFRC522::ComIEnReg,
+        0x00);
+
+    clearReceiveIRQ();
+}
+
+// ============================================================
+// ENABLE / DISABLE SCANNING
+// ============================================================
 
 void RFIDModule::setScanning(bool enabled)
 {
     if (!initialized)
-        return;
-
-    scanning = enabled;
-
-    if (scanning)
     {
+        return;
+    }
+
+    scanningEnabled = enabled;
+
+    if (enabled)
+    {
+
         reader.PCD_AntennaOn();
+        enableReceiveIRQ();
 
-        lastScanTime = millis();
-
-        Serial.println("[RFID] Scanning enabled");
+        lastScanTime =
+            millis() - RFIDConfig::SCAN_INTERVAL_MS;
     }
     else
     {
+
+        disableReceiveIRQ();
         reader.PCD_AntennaOff();
 
         cardPresent = false;
-
-        lastUID = "";
-
-        lastUIDSize = 0;
-
-        Serial.println("[RFID] Scanning disabled");
     }
 }
+
+// ============================================================
+// SCANNING STATUS
+// ============================================================
 
 bool RFIDModule::isScanning() const
 {
-    return scanning;
+    return scanningEnabled;
 }
 
-// ==========================================
-// UID FORMATTING
-// ==========================================
+// ============================================================
+// FORMAT CARD UID
+// ============================================================
 
 String RFIDModule::formatUID()
 {
-    String uid = "";
+    String result;
 
     for (byte i = 0; i < reader.uid.size; i++)
     {
-        if (reader.uid.uidByte[i] < 0x10)
-            uid += "0";
 
-        uid += String(
+        if (i > 0)
+        {
+            result += ":";
+        }
+
+        if (reader.uid.uidByte[i] < 0x10)
+        {
+            result += "0";
+        }
+
+        String value = String(
             reader.uid.uidByte[i],
             HEX);
 
-        if (i < reader.uid.size - 1)
-            uid += ":";
+        value.toUpperCase();
+        result += value;
     }
 
-    uid.toUpperCase();
-
-    return uid;
+    return result;
 }
 
-// ==========================================
-// CARD ACQUISITION
-// ==========================================
+// ============================================================
+// SCAN A CARD
+// ============================================================
 
-bool RFIDModule::readCard()
+void RFIDModule::scanCard()
 {
-    byte atqaBuffer[2];
+    if (!initialized || !scanningEnabled)
+    {
+        return;
+    }
 
-    byte atqaSize = sizeof(atqaBuffer);
+    // PICC_WakeupA actively transmits WUPA.
+    // This is required because passive tags do not
+    // spontaneously send their UIDs.
+    byte atqa[2];
+    byte atqaSize = sizeof(atqa);
 
-    // Wake up cards previously placed in HALT state.
-    MFRC522::StatusCode wakeStatus =
-        reader.PICC_WakeupA(
-            atqaBuffer,
-            &atqaSize);
+    MFRC522::StatusCode result =
+        reader.PICC_WakeupA(atqa, &atqaSize);
 
     if (
-        wakeStatus != MFRC522::STATUS_OK &&
-        wakeStatus != MFRC522::STATUS_COLLISION)
+        result != MFRC522::STATUS_OK &&
+        result != MFRC522::STATUS_COLLISION)
     {
-        return false;
+        return;
     }
 
-    // Read selected card UID
     if (!reader.PICC_ReadCardSerial())
     {
-        return false;
+        return;
     }
 
-    // Release card for subsequent scans
-    reader.PICC_HaltA();
+    String uid = formatUID();
 
-    reader.PCD_StopCrypto1();
+    bool newCard =
+        !cardPresent ||
+        uid != lastUID;
 
-    return true;
-}
+    lastUID = uid;
+    lastUIDSize = reader.uid.size;
 
-// ==========================================
-// CARD DETECTION
-// ==========================================
-
-void RFIDModule::handleCardDetected()
-{
-    String currentUID = formatUID();
-
-    // Check whether this is a new card
-    if (!cardPresent || currentUID != lastUID)
-    {
-        lastUID = currentUID;
-
-        lastUIDSize = reader.uid.size;
-
-        cardPresent = true;
-
-        Serial.println("\n========== RFID EVENT ==========");
-
-        Serial.println("[RFID] CARD DETECTED");
-
-        Serial.printf(
-            "UID: %s\n",
-            lastUID.c_str());
-
-        Serial.printf(
-            "UID length: %u bytes\n",
-            lastUIDSize);
-
-        Serial.printf(
-            "Card type: %s\n",
-            reader.PICC_GetTypeName(
-                reader.PICC_GetType(reader.uid.sak)));
-
-        Serial.println("================================\n");
-    }
-
-    // Update timestamp even if the card is unchanged
     lastDetectionTime = millis();
+    cardPresent = true;
+
+    if (newCard)
+    {
+
+        Serial.print("[RFID EVENT] Card detected: ");
+        Serial.println(lastUID);
+    }
+
+    reader.PICC_HaltA();
+    reader.PCD_StopCrypto1();
 }
 
-// ==========================================
+// ============================================================
 // CARD REMOVAL
-// ==========================================
+// ============================================================
 
-void RFIDModule::handleCardRemoved()
+void RFIDModule::handleCardRemoval()
 {
     if (!cardPresent)
+    {
         return;
+    }
 
     if (
         millis() - lastDetectionTime >=
         RFIDConfig::CARD_REMOVAL_TIMEOUT_MS)
     {
-        Serial.println("\n========== RFID EVENT ==========");
-
-        Serial.println("[RFID] CARD REMOVED");
-
-        Serial.printf(
-            "Previous UID: %s\n",
-            lastUID.c_str());
-
-        Serial.println("================================\n");
-
         cardPresent = false;
 
-        lastUID = "";
-
-        lastUIDSize = 0;
+        Serial.println(
+            "[RFID EVENT] Card removed.");
     }
 }
 
-// ==========================================
-// MAIN SCANNING UPDATE
-// ==========================================
+// ============================================================
+// UPDATE
+// ============================================================
 
 void RFIDModule::update()
 {
-    if (!initialized || !scanning)
+    if (!initialized || !scanningEnabled)
+    {
         return;
+    }
+
+    // The MFRC522 receive IRQ reports responses to
+    // active reader transactions. It does not generate
+    // interrogation commands by itself.
+    //
+    // Continue polling at the established scan interval
+    // so cards can be detected after presentation.
+
+    uint32_t now = millis();
 
     if (
-        millis() - lastScanTime <
+        now - lastScanTime >=
         RFIDConfig::SCAN_INTERVAL_MS)
     {
-        return;
+        lastScanTime = now;
+
+        scanCard();
     }
 
-    lastScanTime = millis();
+    // A receive IRQ may have been raised during
+    // PICC_WakeupA / anticollision.
+    //
+    // The corresponding RFID data is processed through
+    // scanCard() using the normal MFRC522 API.
 
-    if (readCard())
+    if (rfidIRQPending)
     {
-        handleCardDetected();
+        rfidIRQPending = false;
     }
-    else
-    {
-        handleCardRemoved();
-    }
+
+    handleCardRemoval();
 }
 
-// ==========================================
-// TAG INFORMATION
-// ==========================================
+// ============================================================
+// DEEP-SLEEP RFID WAKEUP CAPABILITY
+// ============================================================
+
+bool RFIDModule::prepareForSleepWake()
+{
+    // The MFRC522 has receive-complete interrupts,
+    // but no autonomous low-power card-detection
+    // engine that periodically sends REQA/WUPA.
+    //
+    // Simply enabling RxIRq before deep sleep would
+    // not allow an arbitrary future tag presentation
+    // to wake the ESP32-S3.
+    //
+    // Explicitly report unsupported rather than
+    // giving the scheduler a false readiness signal.
+
+    return false;
+}
+
+// ============================================================
+// WAKEUP STATUS
+// ============================================================
+
+bool RFIDModule::isWakeupEnabled() const
+{
+    return false;
+}
+
+// ============================================================
+// IRQ STATUS
+// ============================================================
+
+bool RFIDModule::isIRQEnabled() const
+{
+    return initialized && irqEnabled;
+}
+
+uint32_t RFIDModule::getIRQCount() const
+{
+    return rfidIRQCount;
+}
+
+bool RFIDModule::isIRQActive() const
+{
+    return digitalRead(RFIDConfig::IRQ_PIN) ==
+           RFIDConfig::IRQ_ACTIVE_LEVEL;
+}
+
+// ============================================================
+// CARD STATUS
+// ============================================================
 
 bool RFIDModule::isCardPresent() const
 {
@@ -309,50 +425,54 @@ uint32_t RFIDModule::getLastDetectionTime() const
     return lastDetectionTime;
 }
 
-// ==========================================
-// WAKE-UP CONFIGURATION
-// ==========================================
-
-bool RFIDModule::isWakeupEnabled() const
-{
-    return RFIDConfig::WAKEUP_ENABLED;
-}
-
-// ==========================================
-// STATUS
-// ==========================================
+// ============================================================
+// PRINT STATUS
+// ============================================================
 
 void RFIDModule::printStatus(Stream &output) const
 {
-    output.println("\n========== RFID MODULE ==========");
+    output.println();
+    output.println("========== RFID ==========");
 
-    output.printf(
-        "Initialized: %s\n",
+    output.print("Initialized: ");
+    output.println(
         initialized ? "YES" : "NO");
 
-    output.printf(
-        "Scanning: %s\n",
-        scanning ? "ON" : "OFF");
+    output.print("Scanning: ");
+    output.println(
+        scanningEnabled ? "ON" : "OFF");
 
-    output.printf(
-        "Card present: %s\n",
+    output.print("IRQ GPIO: ");
+    output.println(RFIDConfig::IRQ_PIN);
+
+    output.print("Receive IRQ: ");
+    output.println(
+        irqEnabled ? "ENABLED" : "DISABLED");
+
+    output.print("IRQ count: ");
+    output.println(rfidIRQCount);
+
+    output.print("IRQ pin state: ");
+    output.println(
+        isIRQActive() ? "ACTIVE" : "INACTIVE");
+
+    output.print("Card present: ");
+    output.println(
         cardPresent ? "YES" : "NO");
 
-    output.printf(
-        "Last UID: %s\n",
-        cardPresent ? lastUID.c_str() : "NONE");
+    output.print("Last UID: ");
+    output.println(
+        lastUID.length() > 0 ? lastUID : "NONE");
 
-    output.printf(
-        "UID length: %u bytes\n",
-        lastUIDSize);
+    output.print("UID size: ");
+    output.println(lastUIDSize);
 
-    output.printf(
-        "Last detection: %lu ms\n",
-        static_cast<unsigned long>(lastDetectionTime));
+    output.print("Last detection: ");
+    output.print(lastDetectionTime);
+    output.println(" ms");
 
-    output.printf(
-        "Wake-up enabled: %s\n",
-        isWakeupEnabled() ? "YES" : "NO");
+    output.println(
+        "Autonomous deep-sleep card wake: UNSUPPORTED");
 
-    output.println("=================================");
+    output.println("==========================");
 }
