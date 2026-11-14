@@ -4,7 +4,6 @@
 #include <math.h>
 #include <stdlib.h>
 #include <errno.h>
-#include <limits.h>
 
 #include "modules/stepper_module.h"
 #include "modules/cooling_stack.h"
@@ -13,6 +12,7 @@
 #include "modules/servo_module.h"
 #include "modules/temperature_module.h"
 #include "modules/switch_module.h"
+#include "modules/schedule_module.h"
 
 // ============================================================
 // MODULE INSTANCES
@@ -25,9 +25,10 @@ RFIDModule rfid;
 ServoModule servo;
 TemperatureModule temperature;
 SwitchModule switches;
+ScheduleModule schedule;
 
 // ============================================================
-// SERIAL CONFIGURATION
+// SERIAL
 // ============================================================
 
 String serialBuffer;
@@ -35,7 +36,7 @@ String serialBuffer;
 static constexpr size_t SERIAL_BUFFER_LIMIT = 128;
 
 // ============================================================
-// SERIAL TOKENIZER
+// TOKENIZER
 // ============================================================
 
 String getToken(const String &input, uint8_t index)
@@ -141,12 +142,10 @@ bool parseUnsignedByte(
 {
     long value;
 
-    if (!parseLong(input, value))
-    {
-        return false;
-    }
-
-    if (value < 0 || value > 255)
+    if (
+        !parseLong(input, value) ||
+        value < 0 ||
+        value > 255)
     {
         return false;
     }
@@ -155,9 +154,7 @@ bool parseUnsignedByte(
     return true;
 }
 
-bool parseOnOff(
-    const String &input,
-    bool &result)
+bool parseOnOff(const String &input, bool &result)
 {
     if (input == "on" || input == "1")
     {
@@ -175,7 +172,7 @@ bool parseOnOff(
 }
 
 // ============================================================
-// MODULE IDENTIFIERS
+// MODULE ID PARSERS
 // ============================================================
 
 bool parseLoadCellID(
@@ -238,6 +235,106 @@ void onSwitchChanged(const SwitchEvent &event)
 }
 
 // ============================================================
+// SCHEDULE WAKE EVENT CALLBACK
+// ============================================================
+
+void onSystemWake(ScheduleWakeReason reason)
+{
+    Serial.println();
+    Serial.println("========== WAKE EVENT ==========");
+
+    Serial.print("[SCHEDULE] Wake reason: ");
+    Serial.println(
+        ScheduleModule::reasonToString(reason));
+
+    switch (reason)
+    {
+
+    case SCHEDULE_WAKE_TIMER:
+
+        Serial.println(
+            "[SCHEDULE] RTC timer wakeup.");
+
+        // Future:
+        // Execute scheduled task module.
+
+        break;
+
+    case SCHEDULE_WAKE_RFID:
+
+        Serial.println(
+            "[SCHEDULE] RFID GPIO1 wakeup.");
+
+        // Future:
+        // Execute RFID task module.
+        // Check and process the presented card.
+
+        break;
+
+    case SCHEDULE_WAKE_OTHER:
+
+        Serial.println(
+            "[SCHEDULE] Other wakeup source.");
+
+        // Future:
+        // Handle another supported wake source.
+
+        break;
+
+    case SCHEDULE_WAKE_COLD_BOOT:
+    default:
+
+        Serial.println(
+            "[SCHEDULE] Normal startup.");
+
+        break;
+    }
+
+    Serial.println("===============================");
+}
+
+// ============================================================
+// PRE-SLEEP SHUTDOWN CALLBACK
+// ============================================================
+
+void prepareSystemForSleep()
+{
+    Serial.println(
+        "[SCHEDULE] Preparing modules for deep sleep.");
+
+    // Immediate motor shutdown.
+    stepper.emergencyStop();
+
+    // Turn off Peltier, fan and pump.
+    cooling.allOff();
+
+    // Disable continuous measurements.
+    loadcells.setContinuous(false);
+
+    // Stop continuous-rotation servo.
+    servo.stop();
+
+    // Disable continuous temperature acquisition.
+    temperature.setContinuous(TEMP1, false);
+    temperature.setContinuous(TEMP2, false);
+    temperature.setContinuous(TEMP3, false);
+
+    // If RFID wakeup is not required, disable scanning.
+    // Future RFID module will configure its special
+    // low-power card-detection / IRQ mode here.
+    if (!schedule.isRFIDWakeupEnabled())
+    {
+        rfid.setScanning(false);
+    }
+
+    // Switches are monitored only while the CPU is awake.
+    // Deep sleep stops normal GPIO polling.
+
+    Serial.println(
+        "[SCHEDULE] Actuators safely commanded OFF.");
+}
+
+// ============================================================
 // SYSTEM STATUS
 // ============================================================
 
@@ -255,6 +352,7 @@ void systemStatus()
     servo.printStatus(Serial);
     temperature.printStatus(Serial);
     switches.printStatus(Serial);
+    schedule.printStatus(Serial);
 
     Serial.println("================================");
 }
@@ -265,7 +363,6 @@ void systemStatus()
 
 void systemOff()
 {
-    // Immediate cancellation of stepper movement.
     stepper.emergencyStop();
 
     cooling.allOff();
@@ -280,9 +377,12 @@ void systemOff()
     temperature.setContinuous(TEMP2, false);
     temperature.setContinuous(TEMP3, false);
 
-    // Switch monitoring stays enabled.
-    Serial.println("[SYSTEM] All actuators stopped.");
-    Serial.println("[SYSTEM] Stepper driver sleeping.");
+    // Cancel any pending entry into deep sleep.
+    // Persisted RTC wake configuration remains unchanged.
+    schedule.cancelPendingSleep();
+
+    Serial.println(
+        "[SYSTEM] All actuators stopped.");
 }
 
 // ============================================================
@@ -363,6 +463,18 @@ void printHelp()
     Serial.println("  switch status");
     Serial.println("  switch read");
 
+    Serial.println();
+    Serial.println("SCHEDULE:");
+    Serial.println("  schedule status");
+    Serial.println("  schedule once <seconds>");
+    Serial.println("  schedule every <seconds>");
+    Serial.println("  schedule cancel");
+    Serial.println("  schedule rfid on|off");
+    Serial.println("  schedule sleep");
+    Serial.println("  schedule sleepin <seconds>");
+    Serial.println("  schedule stay");
+    Serial.println("  schedule wake");
+
     Serial.println("==============================");
 }
 
@@ -389,14 +501,15 @@ void handleStepperCommand(const String &command)
 
         if (!parseLong(arg1, steps))
         {
-            Serial.println("Usage: step move <steps>");
+            Serial.println(
+                "Usage: step move <steps>");
             return;
         }
 
         stepper.moveRelative(steps);
 
         Serial.printf(
-            "[STEPPER] Relative move: %ld steps\n",
+            "[STEPPER] Relative move: %ld\n",
             steps);
 
         return;
@@ -422,10 +535,6 @@ void handleStepperCommand(const String &command)
 
         return;
     }
-
-    // --------------------------------------------------------
-    // CONTINUOUS ROTATION
-    // --------------------------------------------------------
 
     if (
         action == "continuous" ||
@@ -454,15 +563,11 @@ void handleStepperCommand(const String &command)
         stepper.rotateContinuous(speed);
 
         Serial.printf(
-            "[STEPPER] Continuous rotation: %.2f steps/s\n",
+            "[STEPPER] Continuous speed: %.2f steps/s\n",
             stepper.getContinuousSpeed());
 
         return;
     }
-
-    // --------------------------------------------------------
-    // NORMAL STOP
-    // --------------------------------------------------------
 
     if (action == "stop")
     {
@@ -475,10 +580,6 @@ void handleStepperCommand(const String &command)
         return;
     }
 
-    // --------------------------------------------------------
-    // EMERGENCY STOP
-    // --------------------------------------------------------
-
     if (
         action == "emergency" ||
         action == "estop")
@@ -486,14 +587,10 @@ void handleStepperCommand(const String &command)
         stepper.emergencyStop();
 
         Serial.println(
-            "[STEPPER] EMERGENCY STOP.");
+            "[STEPPER] Immediate stop.");
 
         return;
     }
-
-    // --------------------------------------------------------
-    // DRIVER POWER
-    // --------------------------------------------------------
 
     if (action == "sleep")
     {
@@ -517,10 +614,6 @@ void handleStepperCommand(const String &command)
         return;
     }
 
-    // --------------------------------------------------------
-    // SPEED
-    // --------------------------------------------------------
-
     if (action == "speed")
     {
 
@@ -531,56 +624,48 @@ void handleStepperCommand(const String &command)
             speed <= 0.0f)
         {
             Serial.println(
-                "Usage: step speed <positive_steps_per_second>");
+                "Usage: step speed <positive_value>");
             return;
         }
 
         stepper.setMaxSpeed(speed);
 
         Serial.printf(
-            "[STEPPER] Maximum speed: %.2f steps/s\n",
+            "[STEPPER] Max speed: %.2f\n",
             stepper.getMaxSpeed());
 
         return;
     }
 
-    // --------------------------------------------------------
-    // ACCELERATION
-    // --------------------------------------------------------
-
     if (
         action == "accel" ||
         action == "acceleration")
     {
-        float acceleration;
+        float value;
 
         if (
-            !parseFloat(arg1, acceleration) ||
-            acceleration <= 0.0f)
+            !parseFloat(arg1, value) ||
+            value <= 0.0f)
         {
             Serial.println(
-                "Usage: step accel <positive_steps_per_second_squared>");
+                "Usage: step accel <positive_value>");
             return;
         }
 
-        stepper.setAcceleration(acceleration);
+        stepper.setAcceleration(value);
 
         Serial.printf(
-            "[STEPPER] Acceleration: %.2f steps/s2\n",
+            "[STEPPER] Acceleration: %.2f\n",
             stepper.getAcceleration());
 
         return;
     }
 
-    // --------------------------------------------------------
-    // POSITION
-    // --------------------------------------------------------
-
     if (action == "position")
     {
 
         Serial.printf(
-            "[STEPPER] Current: %ld | Target: %ld | Remaining: %ld\n",
+            "[STEPPER] Current=%ld Target=%ld Remaining=%ld\n",
             stepper.getCurrentPosition(),
             stepper.getTargetPosition(),
             stepper.getDistanceToGo());
@@ -594,14 +679,14 @@ void handleStepperCommand(const String &command)
         if (stepper.isMoving())
         {
             Serial.println(
-                "[STEPPER] Stop movement before zeroing.");
+                "[STEPPER] Stop before zeroing.");
             return;
         }
 
         stepper.setCurrentPosition(0);
 
         Serial.println(
-            "[STEPPER] Position set to zero.");
+            "[STEPPER] Position reset.");
 
         return;
     }
@@ -626,7 +711,9 @@ void handleCoolingCommand(const String &command)
 
     if (action == "off")
     {
+
         cooling.allOff();
+
         Serial.println("[COOLING] All outputs OFF.");
         return;
     }
@@ -794,18 +881,18 @@ void handleLoadCommand(const String &command)
     if (action == "scale")
     {
 
-        float scale;
+        float factor;
 
         if (
-            !parseFloat(arg2, scale) ||
-            scale == 0.0f)
+            !parseFloat(arg2, factor) ||
+            factor == 0.0f)
         {
             Serial.println(
                 "Usage: load scale <1|2> <nonzero_factor>");
             return;
         }
 
-        loadcells.setScale(id, scale);
+        loadcells.setScale(id, factor);
 
         Serial.println("[LOAD] Scale updated.");
         return;
@@ -1111,6 +1198,222 @@ void handleSwitchCommand(const String &command)
 }
 
 // ============================================================
+// SCHEDULE COMMAND HANDLER
+// ============================================================
+
+void handleScheduleCommand(const String &command)
+{
+    String action = getToken(command, 1);
+    String arg1 = getToken(command, 2);
+
+    // --------------------------------------------------------
+    // STATUS
+    // --------------------------------------------------------
+
+    if (action == "status")
+    {
+
+        schedule.printStatus(Serial);
+        return;
+    }
+
+    // --------------------------------------------------------
+    // WAKE REASON
+    // --------------------------------------------------------
+
+    if (action == "wake")
+    {
+
+        Serial.print("[SCHEDULE] Wake reason: ");
+
+        Serial.println(
+            ScheduleModule::reasonToString(
+                schedule.getWakeReason()));
+
+        return;
+    }
+
+    // --------------------------------------------------------
+    // ONE-SHOT TIMER
+    // --------------------------------------------------------
+
+    if (action == "once")
+    {
+
+        long seconds;
+
+        if (
+            !parseLong(arg1, seconds) ||
+            seconds < 1)
+        {
+            Serial.println(
+                "Usage: schedule once <seconds>");
+            return;
+        }
+
+        if (
+            !schedule.scheduleOnce(
+                static_cast<uint32_t>(seconds)))
+        {
+            Serial.println(
+                "[SCHEDULE] Invalid timer interval.");
+            return;
+        }
+
+        Serial.printf(
+            "[SCHEDULE] One-shot timer: %ld seconds\n",
+            seconds);
+
+        return;
+    }
+
+    // --------------------------------------------------------
+    // RECURRING TIMER
+    // --------------------------------------------------------
+
+    if (action == "every")
+    {
+
+        long seconds;
+
+        if (
+            !parseLong(arg1, seconds) ||
+            seconds < 1)
+        {
+            Serial.println(
+                "Usage: schedule every <seconds>");
+            return;
+        }
+
+        if (
+            !schedule.scheduleEvery(
+                static_cast<uint32_t>(seconds)))
+        {
+            Serial.println(
+                "[SCHEDULE] Invalid timer interval.");
+            return;
+        }
+
+        Serial.printf(
+            "[SCHEDULE] Recurring timer: %ld seconds\n",
+            seconds);
+
+        return;
+    }
+
+    // --------------------------------------------------------
+    // CANCEL TIMER
+    // --------------------------------------------------------
+
+    if (action == "cancel")
+    {
+
+        schedule.cancelTimer();
+
+        Serial.println(
+            "[SCHEDULE] RTC timer disabled.");
+
+        return;
+    }
+
+    // --------------------------------------------------------
+    // RFID GPIO WAKEUP
+    // --------------------------------------------------------
+
+    if (action == "rfid")
+    {
+
+        bool enabled;
+
+        if (!parseOnOff(arg1, enabled))
+        {
+            Serial.println(
+                "Usage: schedule rfid on|off");
+            return;
+        }
+
+        schedule.setRFIDWakeup(enabled);
+
+        Serial.println(
+            enabled ? "[SCHEDULE] RFID GPIO1 wake enabled." : "[SCHEDULE] RFID GPIO1 wake disabled.");
+
+        return;
+    }
+
+    // --------------------------------------------------------
+    // DEEP SLEEP NOW
+    // --------------------------------------------------------
+
+    if (action == "sleep")
+    {
+
+        Serial.println(
+            "[SCHEDULE] Deep sleep requested.");
+
+        if (!schedule.sleepNow())
+        {
+
+            Serial.println(
+                "[SCHEDULE] Sleep request failed.");
+        }
+
+        return;
+    }
+
+    // --------------------------------------------------------
+    // DELAYED SLEEP
+    // --------------------------------------------------------
+
+    if (action == "sleepin")
+    {
+
+        long seconds;
+
+        if (
+            !parseLong(arg1, seconds) ||
+            seconds < 1)
+        {
+            Serial.println(
+                "Usage: schedule sleepin <seconds>");
+            return;
+        }
+
+        if (
+            !schedule.sleepAfter(
+                static_cast<uint32_t>(seconds)))
+        {
+            Serial.println(
+                "[SCHEDULE] Invalid sleep delay.");
+
+            return;
+        }
+
+        Serial.printf(
+            "[SCHEDULE] Entering deep sleep in %ld seconds\n",
+            seconds);
+
+        return;
+    }
+
+    // --------------------------------------------------------
+    // CANCEL PENDING SLEEP
+    // --------------------------------------------------------
+
+    if (action == "stay")
+    {
+
+        schedule.cancelPendingSleep();
+
+        Serial.println(
+            "[SCHEDULE] Pending sleep canceled.");
+
+        return;
+    }
+
+    Serial.println("[SCHEDULE] Unknown command.");
+}
+
+// ============================================================
 // MAIN COMMAND ROUTER
 // ============================================================
 
@@ -1128,71 +1431,67 @@ void processCommand(String command)
 
     if (module == "help")
     {
-
         printHelp();
         return;
     }
 
     if (module == "status")
     {
-
         systemStatus();
         return;
     }
 
     if (module == "off")
     {
-
         systemOff();
         return;
     }
 
     if (module == "step")
     {
-
         handleStepperCommand(command);
         return;
     }
 
     if (module == "cool")
     {
-
         handleCoolingCommand(command);
         return;
     }
 
     if (module == "load")
     {
-
         handleLoadCommand(command);
         return;
     }
 
     if (module == "rfid")
     {
-
         handleRFIDCommand(command);
         return;
     }
 
     if (module == "servo")
     {
-
         handleServoCommand(command);
         return;
     }
 
     if (module == "temp")
     {
-
         handleTemperatureCommand(command);
         return;
     }
 
     if (module == "switch")
     {
-
         handleSwitchCommand(command);
+        return;
+    }
+
+    if (module == "schedule")
+    {
+        handleScheduleCommand(command);
         return;
     }
 
@@ -1201,7 +1500,7 @@ void processCommand(String command)
 }
 
 // ============================================================
-// SERIAL INPUT PROCESSING
+// SERIAL INPUT
 // ============================================================
 
 void processSerial()
@@ -1209,8 +1508,8 @@ void processSerial()
     while (Serial.available() > 0)
     {
 
-        char character = static_cast<char>(
-            Serial.read());
+        char character =
+            static_cast<char>(Serial.read());
 
         if (
             character == '\n' ||
@@ -1227,9 +1526,10 @@ void processSerial()
             continue;
         }
 
-        if (serialBuffer.length() >= SERIAL_BUFFER_LIMIT)
+        if (
+            serialBuffer.length() >=
+            SERIAL_BUFFER_LIMIT)
         {
-
             serialBuffer = "";
 
             Serial.println(
@@ -1258,12 +1558,27 @@ void setup()
     Serial.println("================================");
 
     // --------------------------------------------------------
+    // SCHEDULE
+    // --------------------------------------------------------
+
+    schedule.begin();
+
+    schedule.setWakeCallback(onSystemWake);
+
+    schedule.setSleepCallback(
+        prepareSystemForSleep);
+
+    Serial.println(
+        "[INIT] Schedule initialized.");
+
+    // --------------------------------------------------------
     // STEPPER
     // --------------------------------------------------------
 
     stepper.begin();
 
-    Serial.println("[INIT] Stepper initialized.");
+    Serial.println(
+        "[INIT] Stepper initialized.");
 
     // --------------------------------------------------------
     // COOLING
@@ -1271,7 +1586,8 @@ void setup()
 
     cooling.begin();
 
-    Serial.println("[INIT] Cooling initialized.");
+    Serial.println(
+        "[INIT] Cooling initialized.");
 
     // --------------------------------------------------------
     // LOAD CELLS
@@ -1279,7 +1595,8 @@ void setup()
 
     loadcells.begin();
 
-    Serial.println("[INIT] Load cells initialized.");
+    Serial.println(
+        "[INIT] Load cells initialized.");
 
     // --------------------------------------------------------
     // RFID
@@ -1288,12 +1605,14 @@ void setup()
     if (rfid.begin())
     {
 
-        Serial.println("[INIT] RFID initialized.");
+        Serial.println(
+            "[INIT] RFID initialized.");
     }
     else
     {
 
-        Serial.println("[INIT] RFID initialization failed.");
+        Serial.println(
+            "[INIT] RFID initialization failed.");
     }
 
     // --------------------------------------------------------
@@ -1302,7 +1621,8 @@ void setup()
 
     servo.begin();
 
-    Serial.println("[INIT] Servo initialized.");
+    Serial.println(
+        "[INIT] Servo initialized.");
 
     // --------------------------------------------------------
     // TEMPERATURE
@@ -1310,17 +1630,28 @@ void setup()
 
     temperature.begin();
 
-    Serial.println("[INIT] Temperature initialized.");
+    Serial.println(
+        "[INIT] Temperature initialized.");
 
     // --------------------------------------------------------
     // SWITCHES
     // --------------------------------------------------------
 
-    switches.setCallback(onSwitchChanged);
+    switches.setCallback(
+        onSwitchChanged);
 
     switches.begin();
 
-    Serial.println("[INIT] Switches initialized.");
+    Serial.println(
+        "[INIT] Switches initialized.");
+
+    // --------------------------------------------------------
+    // WAKE DISPATCH
+    // --------------------------------------------------------
+
+    // All modules are initialized before the wake event.
+    // A future task module can start operations here.
+    schedule.dispatchWakeEvent();
 
     // --------------------------------------------------------
     // READY
@@ -1328,7 +1659,9 @@ void setup()
 
     Serial.println();
     Serial.println("[SYSTEM] Ready.");
-    Serial.println("[SYSTEM] Type 'help' for commands.");
+
+    Serial.println(
+        "[SYSTEM] Type 'help' for commands.");
 
     printHelp();
 }
@@ -1339,16 +1672,19 @@ void setup()
 
 void loop()
 {
-    // Motor stepping must be serviced frequently.
+    // Maintain stepper pulse generation.
     stepper.run();
 
-    // Remaining modules
+    // Existing modules.
     loadcells.update();
     rfid.update();
     servo.update();
     temperature.update();
     switches.update();
 
-    // Non-blocking serial processing
+    // Runtime serial commands.
     processSerial();
+
+    // Deferred entry into deep sleep.
+    schedule.update();
 }
