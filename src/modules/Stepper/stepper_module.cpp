@@ -1,175 +1,513 @@
+
 #include "modules/stepper_module.h"
 
+#include <math.h>
+
+// ============================================================
+// CONSTRUCTOR
+// ============================================================
+
 StepperModule::StepperModule()
-    : driver(
+    : motor(
           AccelStepper::DRIVER,
           StepperConfig::STEP_PIN,
           StepperConfig::DIR_PIN),
-      awake(false)
+      driverAwake(false),
+      mode(STEPPER_IDLE),
+      maxSpeed(StepperConfig::DEFAULT_MAX_SPEED),
+      acceleration(StepperConfig::DEFAULT_ACCELERATION),
+      continuousSpeed(0.0f)
 {
 }
 
-// ==========================================
+// ============================================================
 // INITIALIZATION
-// ==========================================
+// ============================================================
 
 void StepperModule::begin()
 {
+    // Set SLEEP inactive before configuring the pin.
+    digitalWrite(
+        StepperConfig::SLEEP_PIN,
+        StepperConfig::SLEEP_ACTIVE_LEVEL);
+
     pinMode(StepperConfig::SLEEP_PIN, OUTPUT);
 
-    // Wake driver during initialization
-    digitalWrite(StepperConfig::SLEEP_PIN, HIGH);
+    motor.setMaxSpeed(maxSpeed);
+    motor.setAcceleration(acceleration);
 
-    delay(StepperConfig::WAKEUP_DELAY_MS);
+    motor.setMinPulseWidth(2);
+    motor.setCurrentPosition(0);
 
-    awake = true;
-
-    driver.setMaxSpeed(StepperConfig::MAX_SPEED);
-    driver.setAcceleration(StepperConfig::ACCELERATION);
-
-    driver.setCurrentPosition(0);
-
-    StepperModule::sleep();
-
-    Serial.println("[STEPPER] Initialized");
-    Serial.printf(
-        "[STEPPER] Steps per revolution: %u\n",
-        StepperConfig::STEPS_PER_REV);
+    driverAwake = false;
+    mode = STEPPER_IDLE;
+    continuousSpeed = 0.0f;
 }
 
-// ==========================================
-// DRIVER CONTROL
-// ==========================================
+// ============================================================
+// DRIVER WAKE
+// ============================================================
 
 void StepperModule::wake()
 {
-    if (awake)
+    if (driverAwake)
+    {
         return;
+    }
 
-    digitalWrite(StepperConfig::SLEEP_PIN, HIGH);
+    digitalWrite(
+        StepperConfig::SLEEP_PIN,
+        HIGH);
 
-    delay(StepperConfig::WAKEUP_DELAY_MS);
+    delayMicroseconds(
+        StepperConfig::WAKE_DELAY_US);
 
-    awake = true;
-
-    Serial.println("[STEPPER] Driver awake");
+    driverAwake = true;
 }
+
+// ============================================================
+// DRIVER SLEEP
+// ============================================================
 
 void StepperModule::sleep()
 {
-    if (!awake)
+    // Cancel all pending motion.
+    motor.setCurrentPosition(
+        motor.currentPosition());
+
+    continuousSpeed = 0.0f;
+    mode = STEPPER_IDLE;
+
+    digitalWrite(
+        StepperConfig::SLEEP_PIN,
+        StepperConfig::SLEEP_ACTIVE_LEVEL);
+
+    driverAwake = false;
+}
+
+// ============================================================
+// DRIVER STATE
+// ============================================================
+
+bool StepperModule::isAwake()
+{
+    return driverAwake;
+}
+
+// ============================================================
+// PREPARE MOVEMENT
+// ============================================================
+
+void StepperModule::prepareMovement()
+{
+    wake();
+}
+
+// ============================================================
+// FINISH MOVEMENT
+// ============================================================
+
+void StepperModule::finishMovement()
+{
+    if (mode == STEPPER_CONTINUOUS)
+    {
         return;
-
-    // Discard pending movement and stop issuing pulses
-    driver.setCurrentPosition(driver.currentPosition());
-
-    digitalWrite(StepperConfig::SLEEP_PIN, LOW);
-
-    awake = false;
-
-    Serial.println("[STEPPER] Driver sleeping");
-}
-
-bool StepperModule::isAwake() const
-{
-    return awake;
-}
-
-// ==========================================
-// MOVEMENT
-// ==========================================
-
-bool StepperModule::moveRelative(long steps)
-{
-    if (!awake)
-        StepperModule::wake();
-
-    driver.move(steps);
-    while (driver.distanceToGo() != 0)
-    {
-        driver.run();
     }
 
-    StepperModule::sleep();
-
-    return true;
-}
-
-bool StepperModule::moveAbsolute(long position)
-{
-    if (!awake)
-        StepperModule::wake();
-
-    driver.moveTo(position);
-    while (driver.distanceToGo() != 0)
+    if (motor.distanceToGo() != 0)
     {
-        driver.run();
+        return;
     }
 
-    StepperModule::sleep();
+    mode = STEPPER_IDLE;
+    continuousSpeed = 0.0f;
 
-    return true;
+    sleep();
 }
+
+// ============================================================
+// RELATIVE MOVEMENT
+// ============================================================
+
+void StepperModule::moveRelative(long steps)
+{
+    if (steps == 0)
+    {
+        return;
+    }
+
+    // Cancel continuous operation before changing mode.
+    if (mode == STEPPER_CONTINUOUS)
+    {
+        motor.setCurrentPosition(
+            motor.currentPosition());
+        continuousSpeed = 0.0f;
+    }
+
+    prepareMovement();
+
+    mode = STEPPER_POSITION;
+
+    motor.move(steps);
+}
+
+// ============================================================
+// ABSOLUTE MOVEMENT
+// ============================================================
+
+void StepperModule::moveAbsolute(long position)
+{
+    if (
+        mode != STEPPER_CONTINUOUS &&
+        position == motor.currentPosition())
+    {
+        return;
+    }
+
+    if (mode == STEPPER_CONTINUOUS)
+    {
+        motor.setCurrentPosition(
+            motor.currentPosition());
+        continuousSpeed = 0.0f;
+    }
+
+    prepareMovement();
+
+    mode = STEPPER_POSITION;
+
+    motor.moveTo(position);
+}
+
+// ============================================================
+// CONTINUOUS ROTATION
+// ============================================================
+
+void StepperModule::rotateContinuous(float speed)
+{
+    if (!isfinite(speed))
+    {
+        return;
+    }
+
+    if (speed == 0.0f)
+    {
+        stopContinuous();
+        return;
+    }
+
+    // Limit speed to configured maximum.
+    speed = constrain(
+        speed,
+        -maxSpeed,
+        maxSpeed);
+
+    prepareMovement();
+
+    // Cancel any position target.
+    motor.setCurrentPosition(
+        motor.currentPosition());
+
+    continuousSpeed = speed;
+
+    motor.setSpeed(continuousSpeed);
+
+    mode = STEPPER_CONTINUOUS;
+}
+
+// ============================================================
+// STOP CONTINUOUS ROTATION
+// ============================================================
+
+void StepperModule::stopContinuous()
+{
+    if (mode != STEPPER_CONTINUOUS)
+    {
+        return;
+    }
+
+    // runSpeed() uses a constant velocity.
+    // Stop pulses immediately.
+    continuousSpeed = 0.0f;
+
+    motor.setSpeed(0.0f);
+
+    mode = STEPPER_IDLE;
+
+    sleep();
+}
+
+// ============================================================
+// CONTINUOUS STATE
+// ============================================================
+
+bool StepperModule::isContinuous()
+{
+    return mode == STEPPER_CONTINUOUS;
+}
+
+// ============================================================
+// NORMAL STOP
+// ============================================================
 
 void StepperModule::stop()
 {
-    if (!awake)
+    if (mode == STEPPER_CONTINUOUS)
+    {
+        stopContinuous();
         return;
+    }
 
-    // Controlled deceleration
-    driver.stop();
+    if (mode == STEPPER_POSITION)
+    {
 
-    StepperModule::sleep();
+        // AccelStepper decelerates toward a stop.
+        motor.stop();
+
+        if (motor.distanceToGo() == 0)
+        {
+            finishMovement();
+        }
+
+        return;
+    }
+
+    sleep();
 }
 
-void StepperModule::run()
+// ============================================================
+// EMERGENCY STOP
+// ============================================================
+
+void StepperModule::emergencyStop()
 {
-    if (!awake)
-        StepperModule::wake();
+    // Immediately cancel all motion commands.
+    motor.setCurrentPosition(
+        motor.currentPosition());
 
-    driver.run();
+    continuousSpeed = 0.0f;
+    mode = STEPPER_IDLE;
+
+    sleep();
 }
 
-// ==========================================
-// MOTION CONFIGURATION
-// ==========================================
+// ============================================================
+// MAXIMUM SPEED
+// ============================================================
 
 void StepperModule::setMaxSpeed(float speed)
 {
-    if (speed <= 0)
+    if (!isfinite(speed) || speed <= 0.0f)
+    {
         return;
+    }
 
-    driver.setMaxSpeed(speed);
+    maxSpeed = speed;
+
+    motor.setMaxSpeed(maxSpeed);
+
+    if (mode == STEPPER_CONTINUOUS)
+    {
+
+        continuousSpeed = constrain(
+            continuousSpeed,
+            -maxSpeed,
+            maxSpeed);
+
+        motor.setSpeed(continuousSpeed);
+    }
 }
 
-void StepperModule::setAcceleration(float acceleration)
+// ============================================================
+// ACCELERATION
+// ============================================================
+
+void StepperModule::setAcceleration(float value)
 {
-    if (acceleration <= 0)
+    if (!isfinite(value) || value <= 0.0f)
+    {
         return;
+    }
 
-    driver.setAcceleration(acceleration);
+    acceleration = value;
+
+    motor.setAcceleration(acceleration);
 }
 
-// ==========================================
-// POSITION INFORMATION
-// ==========================================
+// ============================================================
+// SPEED GETTERS
+// ============================================================
+
+float StepperModule::getMaxSpeed()
+{
+    return maxSpeed;
+}
+
+float StepperModule::getAcceleration()
+{
+    return acceleration;
+}
+
+float StepperModule::getContinuousSpeed()
+{
+    return continuousSpeed;
+}
+
+// ============================================================
+// POSITION GETTERS
+// ============================================================
 
 long StepperModule::getCurrentPosition()
 {
-    return driver.currentPosition();
+    return motor.currentPosition();
 }
 
 long StepperModule::getTargetPosition()
 {
-    return driver.targetPosition();
+    return motor.targetPosition();
 }
 
 long StepperModule::getDistanceToGo()
 {
-    return driver.distanceToGo();
+    return motor.distanceToGo();
 }
+
+// ============================================================
+// MOVEMENT STATUS
+// ============================================================
 
 bool StepperModule::isMoving()
 {
-    return driver.isRunning();
+    if (mode == STEPPER_CONTINUOUS)
+    {
+        return continuousSpeed != 0.0f;
+    }
+
+    if (mode == STEPPER_POSITION)
+    {
+        return motor.distanceToGo() != 0;
+    }
+
+    return false;
+}
+
+// ============================================================
+// MODE GETTER
+// ============================================================
+
+StepperMode StepperModule::getMode()
+{
+    return mode;
+}
+
+// ============================================================
+// SET CURRENT POSITION
+// ============================================================
+
+void StepperModule::setCurrentPosition(long position)
+{
+    // Re-zeroing while moving is not allowed.
+    if (isMoving())
+    {
+        return;
+    }
+
+    motor.setCurrentPosition(position);
+
+    // Position update does not require energizing the driver.
+    mode = STEPPER_IDLE;
+}
+
+// ============================================================
+// MAIN MOTOR UPDATE
+// ============================================================
+
+void StepperModule::run()
+{
+    if (!driverAwake)
+    {
+        return;
+    }
+
+    switch (mode)
+    {
+
+    case STEPPER_POSITION:
+
+        motor.run();
+
+        if (motor.distanceToGo() == 0)
+        {
+            finishMovement();
+        }
+
+        break;
+
+    case STEPPER_CONTINUOUS:
+
+        // Constant-speed, non-blocking stepping.
+        motor.runSpeed();
+
+        break;
+
+    case STEPPER_IDLE:
+    default:
+
+        sleep();
+        break;
+    }
+}
+
+// ============================================================
+// STATUS
+// ============================================================
+
+void StepperModule::printStatus(Stream &output)
+{
+    output.println();
+    output.println("========== STEPPER ==========");
+
+    output.print("Driver: ");
+    output.println(
+        driverAwake ? "AWAKE" : "SLEEP");
+
+    output.print("Mode: ");
+
+    switch (mode)
+    {
+
+    case STEPPER_POSITION:
+        output.println("POSITION");
+        break;
+
+    case STEPPER_CONTINUOUS:
+        output.println("CONTINUOUS");
+        break;
+
+    default:
+        output.println("IDLE");
+        break;
+    }
+
+    output.print("Moving: ");
+    output.println(isMoving() ? "YES" : "NO");
+
+    output.print("Current position: ");
+    output.println(getCurrentPosition());
+
+    output.print("Target position: ");
+    output.println(getTargetPosition());
+
+    output.print("Distance to go: ");
+    output.println(getDistanceToGo());
+
+    output.print("Maximum speed: ");
+    output.println(maxSpeed);
+
+    output.print("Acceleration: ");
+    output.println(acceleration);
+
+    output.print("Continuous speed: ");
+    output.println(continuousSpeed);
+
+    output.println("=============================");
 }
