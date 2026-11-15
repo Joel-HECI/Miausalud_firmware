@@ -35,14 +35,14 @@ bool SwitchModule::begin()
     {
         // Active LOW switches use internal pull-ups.
         // Active HIGH switches use internal pull-downs.
-        if (config.activeLevels[i] == LOW)
-        {
-            pinMode(config.pins[i], INPUT_PULLUP);
-        }
-        else
-        {
-            pinMode(config.pins[i], INPUT_PULLDOWN);
-        }
+        // if (config.activeLevels[i] == LOW)
+        // {
+        pinMode(config.pins[i], INPUT_PULLDOWN);
+        // }
+        // else
+        // {
+        //     pinMode(config.pins[i], INPUT_PULLDOWN);
+        // }
     }
 
     // Allow input levels to settle.
