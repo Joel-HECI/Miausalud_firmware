@@ -10,7 +10,8 @@ enum SwitchID : uint8_t
     SWITCH_2 = 2,
     SWITCH_3 = 3,
     SWITCH_4 = 4,
-    SWITCH_5 = 5,
+
+        SWITCH_5 = 5,
     SWITCH_6 = 6
 };
 
